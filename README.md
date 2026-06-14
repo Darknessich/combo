@@ -129,3 +129,7 @@ examples/maze.cpp     генератор лабиринтов
 tests/tests.cpp       юнит-проверки + round-trip generate→parse
 CMakeLists.txt
 ```
+
+## Лицензия
+
+MIT — подробности в файле [LICENSE](LICENSE).
