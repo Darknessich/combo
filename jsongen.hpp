@@ -14,10 +14,11 @@
 //     std::mt19937 rng(seed);
 //     json::value doc = user(rng);   // a fresh random document
 //
-// Each builder is assembled from gen.hpp combinators (range, real, oneof, map,
-// repeat) and then type-erased to a common `schema` so heterogeneous fields can
-// live in one object.
+// A `schema` is itself a gen.hpp generator, so the whole module is expressed by
+// composing generator combinators (map, bind, repeat, range, oneof) — the same
+// algebra json.hpp consumes with.
 //
+#include <cstddef>
 #include <functional>
 #include <random>
 #include <string>
@@ -29,84 +30,83 @@
 
 namespace jsongen {
 
-// A schema is just a generator of JSON values with a uniform, erased type.
-using schema = std::function<json::value(std::mt19937&)>;
+namespace g = combo::gen;
 
-// Erase a gen.hpp generator<...> (that yields json::value) into a schema.
+// A type-erased generator of JSON values. Being a generator itself, it composes
+// with every gen.hpp combinator.
+using schema = g::generator<std::function<json::value(std::mt19937&)>>;
+
+// Erase any json::value generator (or RNG -> value callable) into a schema.
 template <class G>
-schema erase(G g) {
-    return [g = std::move(g)](std::mt19937& rng) { return g(rng); };
+schema erase(G gen) {
+    return schema{std::function<json::value(std::mt19937&)>{
+        [gen = std::move(gen)](std::mt19937& rng) { return gen(rng); }}};
 }
 
 // --- scalars ---------------------------------------------------------------
 
-inline schema null() {
-    return [](std::mt19937&) { return json::value{nullptr}; };
-}
+inline schema null() { return erase(g::constant(json::value{nullptr})); }
 
 inline schema boolean() {
-    return erase(combo::gen::map(combo::gen::range(0, 1),
-                                 [](long b) { return json::value{b != 0}; }));
+    return erase(g::map(g::range(0, 1),
+                        [](long b) { return json::value{b != 0}; }));
 }
 
 // An integer-valued JSON number in [lo, hi].
 inline schema integer(long lo, long hi) {
-    return erase(combo::gen::map(combo::gen::range(lo, hi), [](long x) {
+    return erase(g::map(g::range(lo, hi), [](long x) {
         return json::value{static_cast<double>(x)};
     }));
 }
 
 // A real JSON number in [lo, hi).
 inline schema number(double lo, double hi) {
-    return erase(combo::gen::map(combo::gen::real(), [lo, hi](double u) {
+    return erase(g::map(g::real(), [lo, hi](double u) {
         return json::value{lo + u * (hi - lo)};
     }));
 }
 
 // A string drawn from a fixed set of options.
 inline schema one_of_str(std::vector<std::string> options) {
-    return erase(combo::gen::map(
-        combo::gen::oneof(std::move(options)),
-        [](std::string s) { return json::value{std::move(s)}; }));
+    return erase(g::map(g::oneof(std::move(options)),
+                        [](std::string s) { return json::value{std::move(s)}; }));
 }
 
 // --- composites ------------------------------------------------------------
 
-// An array of [lo, hi] elements, each drawn from `elem`.
-inline schema array_of(schema elem, int lo, int hi) {
-    return [elem = std::move(elem), lo, hi](std::mt19937& rng) {
-        long n = combo::gen::range(lo, hi)(rng);
-        json::array a;
-        a.reserve(static_cast<std::size_t>(n));
-        for (long i = 0; i < n; ++i) a.push_back(elem(rng));
-        return json::value{std::move(a)};
-    };
+// Pick one of several alternatives uniformly  (dual of parser `a | b`):
+// roll an index, then run that schema.
+inline schema one_of(std::vector<schema> alts) {
+    return erase(g::bind(g::range(0, static_cast<long>(alts.size()) - 1),
+                         [alts = std::move(alts)](long i) { return alts[i]; }));
 }
 
-// An object with the given named fields (insertion order preserved).
+// An array of [lo, hi] elements, each drawn from `elem`  (dual of parser many):
+// roll a length, repeat the element generator, wrap as a JSON array.
+inline schema array_of(schema elem, int lo, int hi) {
+    return erase(g::bind(g::range(lo, hi), [elem = std::move(elem)](long n) {
+        return g::map(g::repeat(elem, static_cast<std::size_t>(n)),
+                      [](json::array a) { return json::value{std::move(a)}; });
+    }));
+}
+
+// With probability `p` produce `inner`, otherwise null  (dual of parser opt).
+inline schema optional(schema inner, double p = 0.5) {
+    return erase(g::bind(g::real(),
+                         [inner = std::move(inner), p](double u) -> schema {
+                             return u < p ? inner : null();
+                         }));
+}
+
+// An object with the given named fields (insertion order preserved). A record
+// is a fold over its fields: run each field's generator and collect the pairs.
 inline schema obj(std::vector<std::pair<std::string, schema>> fields) {
-    return [fields = std::move(fields)](std::mt19937& rng) {
+    return erase([fields = std::move(fields)](std::mt19937& rng) {
         json::object o;
         o.reserve(fields.size());
-        for (const auto& [key, gen] : fields) o.emplace_back(key, gen(rng));
+        for (const auto& [key, field] : fields) o.emplace_back(key, field(rng));
         return json::value{std::move(o)};
-    };
-}
-
-// Pick one of several alternatives uniformly  (dual of parser `a | b`).
-inline schema one_of(std::vector<schema> alts) {
-    return [alts = std::move(alts)](std::mt19937& rng) {
-        std::uniform_int_distribution<std::size_t> d(0, alts.size() - 1);
-        return alts[d(rng)](rng);
-    };
-}
-
-// With probability `p_present` produce `inner`, otherwise null.
-inline schema optional(schema inner, double p_present = 0.5) {
-    return [inner = std::move(inner), p_present](std::mt19937& rng) {
-        if (combo::gen::real()(rng) < p_present) return inner(rng);
-        return json::value{nullptr};
-    };
+    });
 }
 
 }  // namespace jsongen
