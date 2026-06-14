@@ -22,3 +22,8 @@ target_link_libraries(json_gen PRIVATE combo)
 
 add_executable(maze examples/maze.cpp)
 target_link_libraries(maze PRIVATE combo)
+
+enable_testing()
+add_executable(combo_tests tests/tests.cpp)
+target_link_libraries(combo_tests PRIVATE combo)
+add_test(NAME combo_tests COMMAND combo_tests)
