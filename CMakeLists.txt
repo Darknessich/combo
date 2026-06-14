@@ -16,3 +16,9 @@ target_compile_features(combo INTERFACE cxx_std_20)
 
 add_executable(json examples/json.cpp)
 target_link_libraries(json PRIVATE combo)
+
+add_executable(json_gen examples/json_gen.cpp)
+target_link_libraries(json_gen PRIVATE combo)
+
+add_executable(maze examples/maze.cpp)
+target_link_libraries(maze PRIVATE combo)
