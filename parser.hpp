@@ -175,6 +175,14 @@ constexpr auto sym(T t) {
     return satisfy([t](const auto& x) { return x == t; }, std::move(what));
 }
 
+// Match one char out of a set, e.g. one_of("+-").
+inline auto one_of(std::string set, std::string name = {}) {
+    std::string what = name.empty() ? "one of \"" + set + "\"" : std::move(name);
+    return satisfy(
+        [set = std::move(set)](char c) { return set.find(c) != std::string::npos; },
+        std::move(what));
+}
+
 // Succeed without consuming anything, yielding v.
 template <class V>
 constexpr auto pure(V v) {
@@ -324,22 +332,27 @@ constexpr auto seq(P p, Q q, Rest... rest) {
 // Repetition
 // ===========================================================================
 
-// many(p) : zero or more p, collected into a vector (always succeeds).
+// many(p) : zero or more p, collected into a vector. Stops when p fails without
+// consuming; but if p fails *after* consuming input, that is a real error.
 template <Parser P>
 constexpr auto many(P p) {
     return make_parser([p = std::move(p)](auto in) {
         using Tok = typename decltype(in)::value_type;
         using V = std::remove_cvref_t<decltype(p(in)->value)>;
+        using R = parse_result<Tok, std::vector<V>>;
         std::vector<V> acc;
         auto cur = in;
         for (;;) {
             auto r = p(cur);
-            if (!r || r->rest.size() == cur.size()) break;  // stop, no progress
+            if (!r) {
+                if (r.error().pos > cur.pos()) return R{std::unexpected(r.error())};
+                break;  // failed without consuming -> done
+            }
+            if (r->rest.size() == cur.size()) break;  // no progress
             acc.push_back(std::move(r->value));
             cur = r->rest;
         }
-        return parse_result<Tok, std::vector<V>>{
-            result<Tok, std::vector<V>>{cur, std::move(acc)}};
+        return R{result<Tok, std::vector<V>>{cur, std::move(acc)}};
     });
 }
 
@@ -357,7 +370,11 @@ constexpr auto many1(P p) {
         auto cur = first->rest;
         for (;;) {
             auto r = p(cur);
-            if (!r || r->rest.size() == cur.size()) break;
+            if (!r) {
+                if (r.error().pos > cur.pos()) return R{std::unexpected(r.error())};
+                break;
+            }
+            if (r->rest.size() == cur.size()) break;
             acc.push_back(std::move(r->value));
             cur = r->rest;
         }
@@ -418,6 +435,66 @@ constexpr auto sep_by(P p, S s) {
 template <Parser O, Parser P, Parser C>
 constexpr auto between(O o, P p, C c) {
     return (std::move(o) >> std::move(p)) << std::move(c);
+}
+
+// count(n, p) : exactly n occurrences of p.
+template <Parser P>
+constexpr auto count(std::size_t n, P p) {
+    return make_parser([p = std::move(p), n](auto in) {
+        using Tok = typename decltype(in)::value_type;
+        using V = std::remove_cvref_t<decltype(p(in)->value)>;
+        using R = parse_result<Tok, std::vector<V>>;
+        std::vector<V> acc;
+        acc.reserve(n);
+        auto cur = in;
+        for (std::size_t i = 0; i < n; ++i) {
+            auto r = p(cur);
+            if (!r) return R{std::unexpected(r.error())};
+            acc.push_back(std::move(r->value));
+            cur = r->rest;
+        }
+        return R{result<Tok, std::vector<V>>{cur, std::move(acc)}};
+    });
+}
+
+// ===========================================================================
+// String assembly: turn parser results into / concatenate them as strings.
+// ===========================================================================
+
+namespace detail {
+inline std::string as_text(char c) { return std::string(1, c); }
+inline std::string as_text(std::string s) { return s; }
+inline std::string as_text(const std::optional<char>& o) {
+    return o ? std::string(1, *o) : std::string{};
+}
+inline std::string as_text(const std::optional<std::string>& o) {
+    return o ? *o : std::string{};
+}
+inline std::string as_text(const std::vector<char>& v) {
+    return std::string(v.begin(), v.end());
+}
+inline std::string as_text(const std::vector<std::string>& v) {
+    std::string s;
+    for (const auto& x : v) s += x;
+    return s;
+}
+}  // namespace detail
+
+// stringify(p) : render p's value (char / optional / vector / string) as text.
+template <Parser P>
+constexpr auto stringify(P p) {
+    return map(std::move(p), [](const auto& v) { return detail::as_text(v); });
+}
+
+// cat(p...) : run all in order and concatenate their values as text.
+template <Parser... Ps>
+constexpr auto cat(Ps... ps) {
+    return map(seq(std::move(ps)...), [](auto tup) {
+        std::string s;
+        std::apply([&](const auto&... xs) { ((s += detail::as_text(xs)), ...); },
+                   tup);
+        return s;
+    });
 }
 
 // ===========================================================================

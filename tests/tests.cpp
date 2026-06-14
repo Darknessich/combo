@@ -171,7 +171,13 @@ void test_errors() {
     // a committed, specific error survives the "value" label
     auto e3 = json::parse("\"abc");
     CHECK(!e3);
-    CHECK(e3.error().msg.find("string") != std::string::npos);
+    CHECK(e3.error().col == 5);  // points just past the unterminated "abc
+    CHECK(e3.error().msg.find("end of input") != std::string::npos);
+
+    // a bad escape inside a string is reported as such (consumed-aware many)
+    auto e6 = json::parse("\"a\\qb\"");
+    CHECK(!e6);
+    CHECK(e6.error().msg.find("escape") != std::string::npos);
 
     // missing value inside an object
     auto e4 = json::parse("{\n  \"a\": 1,\n  \"b\":\n}");

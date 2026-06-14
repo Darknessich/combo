@@ -141,97 +141,89 @@ inline combo::parse_result<char, value> parse_value(combo::array_view<char> in);
 
 inline const auto jvalue = combo::make_parser(&parse_value);
 
-// A quoted string with the usual JSON escapes (\uXXXX limited to the BMP).
-// No leading-whitespace handling here: callers wrap it in lexeme() where needed.
-inline const auto jstring_raw = combo::make_parser([](auto in) {
-    using R = combo::parse_result<char, std::string>;
-    std::size_t i = 0, n = in.size();
-    if (!(i < n && in[i] == '"'))
-        return R{combo::err(in.pos(), "expected string")};
-    ++i;
+// --- string, expressed as grammar -----------------------------------------
+//
+//   string    = '"' (escape | unescaped)* '"'
+//   escape    = '\' ( '"' | '\' | '/' | 'n' | 't' | 'r' | 'b' | 'f'
+//                    | 'u' hex hex hex hex )
+//   unescaped = any char except '"' and '\'
+
+// Encode a Unicode code point (BMP only) as UTF-8.
+inline std::string utf8_encode(int cp) {
     std::string s;
-    while (i < n && in[i] != '"') {
-        char c = in[i++];
-        if (c != '\\') {
-            s.push_back(c);
-            continue;
-        }
-        if (i >= n)
-            return R{combo::err(in.pos() + i, "unterminated escape sequence")};
-        char e = in[i++];
-        switch (e) {
-            case '"': s.push_back('"'); break;
-            case '\\': s.push_back('\\'); break;
-            case '/': s.push_back('/'); break;
-            case 'n': s.push_back('\n'); break;
-            case 't': s.push_back('\t'); break;
-            case 'r': s.push_back('\r'); break;
-            case 'b': s.push_back('\b'); break;
-            case 'f': s.push_back('\f'); break;
-            case 'u': {
-                if (i + 4 > n)
-                    return R{combo::err(in.pos() + i, "incomplete \\u escape")};
-                int cp = 0;
-                for (int k = 0; k < 4; ++k) {
-                    char h = in[i++];
-                    cp <<= 4;
-                    if (h >= '0' && h <= '9') cp |= h - '0';
-                    else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
-                    else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
-                    else return R{combo::err(in.pos() + i, "invalid \\u hex digit")};
-                }
-                if (cp < 0x80) {
-                    s.push_back(static_cast<char>(cp));
-                } else if (cp < 0x800) {
-                    s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-                    s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                } else {
-                    s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-                    s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                    s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                }
-                break;
-            }
-            default:
-                return R{combo::err(in.pos() + i, "invalid escape character")};
-        }
+    if (cp < 0x80) {
+        s.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
     }
-    if (!(i < n && in[i] == '"'))
-        return R{combo::err(in.pos() + i, "unterminated string")};
-    ++i;
-    return R{combo::result<char, std::string>{in.drop(i), std::move(s)}};
-});
+    return s;
+}
+
+inline const auto hex_digit = combo::satisfy(
+    [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F');
+    },
+    "hex digit");
+
+inline const auto unicode_escape = combo::map(
+    combo::sym('u') >> combo::count(4, hex_digit), [](std::vector<char> hs) {
+        int cp = 0;
+        for (char h : hs)
+            cp = cp * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+        return utf8_encode(cp);
+    });
+
+// A single escape char (after the backslash) mapped to its decoded text.
+inline auto escaped(char c, std::string decoded) {
+    return combo::map(combo::sym(c),
+                      [decoded = std::move(decoded)](char) { return decoded; });
+}
+
+inline const auto escape =
+    combo::sym('\\') >>
+    combo::label(escaped('"', "\"") | escaped('\\', "\\") | escaped('/', "/") |
+                     escaped('n', "\n") | escaped('t', "\t") |
+                     escaped('r', "\r") | escaped('b', "\b") |
+                     escaped('f', "\f") | unicode_escape,
+                 "escape sequence");
+
+inline const auto unescaped = combo::stringify(combo::satisfy(
+    [](char c) { return c != '"' && c != '\\'; }, "string character"));
+
+// A bare string literal (no leading-whitespace handling; callers add lexeme).
+inline const auto jstring_raw =
+    combo::between(combo::sym('"'),
+                   combo::stringify(combo::many(escape | unescaped)),
+                   combo::sym('"'));
 
 inline const auto jstring =
     combo::map(jstring_raw, [](std::string s) { return value{std::move(s)}; });
 
-// A JSON number, scanned then converted via strtod.
-inline const auto jnumber = combo::make_parser([](auto in) {
-    using R = combo::parse_result<char, value>;
-    std::size_t i = 0, n = in.size();
-    auto is_digit = [&](std::size_t k) {
-        return k < n && in[k] >= '0' && in[k] <= '9';
-    };
-    if (i < n && in[i] == '-') ++i;
-    if (!is_digit(i)) return R{combo::err(in.pos() + i, "expected number")};
-    while (is_digit(i)) ++i;
-    if (i < n && in[i] == '.') {
-        ++i;
-        if (!is_digit(i))
-            return R{combo::err(in.pos() + i, "expected digit after '.'")};
-        while (is_digit(i)) ++i;
-    }
-    if (i < n && (in[i] == 'e' || in[i] == 'E')) {
-        ++i;
-        if (i < n && (in[i] == '+' || in[i] == '-')) ++i;
-        if (!is_digit(i))
-            return R{combo::err(in.pos() + i, "expected digit in exponent")};
-        while (is_digit(i)) ++i;
-    }
-    std::string num(in.begin(), in.begin() + i);
-    double d = std::strtod(num.c_str(), nullptr);
-    return R{combo::result<char, value>{in.drop(i), value{d}}};
-});
+// --- number, expressed as grammar -----------------------------------------
+//
+//   number = '-'? digit+ ('.' digit+)? ([eE] [+-]? digit+)?
+
+inline const auto digit =
+    combo::satisfy([](char c) { return c >= '0' && c <= '9'; }, "digit");
+inline const auto digits = combo::many1(digit);
+
+inline const auto int_part = combo::cat(combo::opt(combo::sym('-')), digits);
+inline const auto frac_part =
+    combo::cat(combo::sym('.'), digits) | combo::pure(std::string{});
+inline const auto exp_part =
+    combo::cat(combo::one_of("eE"), combo::opt(combo::one_of("+-")), digits) |
+    combo::pure(std::string{});
+
+inline const auto jnumber =
+    combo::map(combo::cat(int_part, frac_part, exp_part), [](std::string s) {
+        return value{std::strtod(s.c_str(), nullptr)};
+    });
 
 inline const auto jbool =
     combo::map(combo::literal("true"),

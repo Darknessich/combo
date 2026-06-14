@@ -55,11 +55,13 @@ ctest --test-dir build --output-on-failure
 
 ## Пример 1 — JSON-парсер (`examples/json.cpp`)
 
-Грамматика целиком собрана из комбинаторов: последовательность (`>>`, `<<`,
-`seq`), выбор (`|`), повторение (`many1`, `sep_by`), группировка (`between`) и
-преобразование значения (`map`). Грамматика рекурсивна — массивы и объекты
-содержат значения, — поэтому рекурсия замыкается через указатель на функцию
-(`make_parser(&parse_value)`), что не даёт типу разрастись до бесконечного.
+Грамматика целиком собрана из комбинаторов — включая лексику (числа, строки,
+escape-последовательности): последовательность (`>>`, `<<`, `seq`), выбор (`|`),
+повторение (`many1`, `count`, `sep_by`), группировку (`between`), сборку строк
+(`cat`, `stringify`) и преобразование значения (`map`). Грамматика рекурсивна —
+массивы и объекты содержат значения, — поэтому рекурсия замыкается через
+указатель на функцию (`make_parser(&parse_value)`), что не даёт типу разрастись
+до бесконечного.
 
 ```cpp
 const auto jarray = combo::map(
@@ -67,6 +69,13 @@ const auto jarray = combo::map(
                    combo::sep_by(jvalue, combo::tok(',')),
                    combo::tok(']')),
     [](json::array a) { return json::value{std::move(a)}; });
+
+// число — тоже грамматика, без ручного сканирования:
+//   number = '-'? digit+ ('.' digit+)? ([eE] [+-]? digit+)?
+const auto int_part = combo::cat(combo::opt(combo::sym('-')), digits);
+const auto frac     = combo::cat(combo::sym('.'), digits) | combo::pure("");
+const auto jnumber  = combo::map(combo::cat(int_part, frac, exp_part),
+                                 [](std::string s) { return value{std::stod(s)}; });
 ```
 
 При неуспехе `combo::parse` возвращает `std::expected<value, combo::error>`, где
