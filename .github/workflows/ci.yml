@@ -7,26 +7,37 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.os }} / ${{ matrix.cxx }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, cc: gcc, cxx: g++ }
-          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
-          - { os: macos-latest, cc: clang, cxx: clang++ }
+          # gcc on Linux uses libstdc++ (>= 12 has <expected>).
+          - { name: linux-gcc, os: ubuntu-latest, cc: gcc, cxx: g++,
+              packages: "", cxxflags: "" }
+          # clang on Linux defaults to libstdc++ too, but that pairing lacks
+          # <expected>; point it at libc++ instead.
+          - { name: linux-clang, os: ubuntu-latest, cc: clang, cxx: clang++,
+              packages: "libc++-dev libc++abi-dev", cxxflags: "-stdlib=libc++" }
+          # AppleClang ships libc++ with <expected>.
+          - { name: macos-clang, os: macos-latest, cc: clang, cxx: clang++,
+              packages: "", cxxflags: "" }
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install toolchain
+        if: runner.os == 'Linux' && matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+
       - name: Configure
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_CXX_FLAGS="-Wall -Wextra"
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra ${{ matrix.cxxflags }}"
 
       - name: Build
         run: cmake --build build
