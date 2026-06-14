@@ -1,13 +1,14 @@
 # combo
 
-Небольшая header-only библиотека **комбинаторов** на C++20 вместе с примерами,
+Небольшая header-only библиотека **комбинаторов** на C++23 вместе с примерами,
 которые показывают две её дуальные стороны.
 
 * **`parser.hpp`** — парсер-комбинаторы. Парсер *потребляет* поток токенов и
-  при успехе возвращает значение вместе с непрожёванным остатком входа:
+  либо возвращает значение с непрожёванным остатком входа, либо ошибку с
+  позицией:
 
   ```cpp
-  parser : array_view<Token> -> optional<result<Token, R>>
+  parser : array_view<Token> -> std::expected<result<Token, R>, error>
   ```
 
 * **`gen.hpp`** — генератор-комбинаторы, категорный дуал. Генератор
@@ -66,6 +67,18 @@ const auto jarray = combo::map(
                    combo::sep_by(jvalue, combo::tok(',')),
                    combo::tok(']')),
     [](json::array a) { return json::value{std::move(a)}; });
+```
+
+При неуспехе `combo::parse` возвращает `std::expected<value, combo::error>`, где
+`error` несёт `line`, `col` и сообщение. Диагностика старается быть точной: `|`
+при провале всех веток сообщает «самую дальнюю» ошибку, а `sep_by` отличает
+«элемента нет» от «элемент начался и сломался».
+
+```text
+$ ./build/json '[1, 2, ]'
+parse error at 1:8: expected value
+$ ./build/json '{"a": 1 "b": 2}'
+parse error at 1:9: expected '}'
 ```
 
 ## Пример 2 — JSON-генератор по схеме (`examples/json_gen.cpp`)

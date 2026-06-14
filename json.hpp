@@ -6,10 +6,10 @@
 // (>>, <<, seq), choice (|), repetition (many1, sep_by), grouping (between)
 // and value transformation (map). The grammar is recursive (arrays/objects
 // contain values), tied together through a function pointer so the parser
-// type stays finite.
+// type stays finite. Failures carry a positioned combo::error.
 //
 #include <cstdlib>
-#include <optional>
+#include <expected>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -142,10 +142,12 @@ inline combo::parse_result<char, value> parse_value(combo::array_view<char> in);
 inline const auto jvalue = combo::make_parser(&parse_value);
 
 // A quoted string with the usual JSON escapes (\uXXXX limited to the BMP).
-inline const auto jstring_raw = combo::lexeme(combo::make_parser([](auto in) {
+// No leading-whitespace handling here: callers wrap it in lexeme() where needed.
+inline const auto jstring_raw = combo::make_parser([](auto in) {
     using R = combo::parse_result<char, std::string>;
     std::size_t i = 0, n = in.size();
-    if (!(i < n && in[i] == '"')) return R{};
+    if (!(i < n && in[i] == '"'))
+        return R{combo::err(in.pos(), "expected string")};
     ++i;
     std::string s;
     while (i < n && in[i] != '"') {
@@ -154,7 +156,8 @@ inline const auto jstring_raw = combo::lexeme(combo::make_parser([](auto in) {
             s.push_back(c);
             continue;
         }
-        if (i >= n) return R{};
+        if (i >= n)
+            return R{combo::err(in.pos() + i, "unterminated escape sequence")};
         char e = in[i++];
         switch (e) {
             case '"': s.push_back('"'); break;
@@ -166,7 +169,8 @@ inline const auto jstring_raw = combo::lexeme(combo::make_parser([](auto in) {
             case 'b': s.push_back('\b'); break;
             case 'f': s.push_back('\f'); break;
             case 'u': {
-                if (i + 4 > n) return R{};
+                if (i + 4 > n)
+                    return R{combo::err(in.pos() + i, "incomplete \\u escape")};
                 int cp = 0;
                 for (int k = 0; k < 4; ++k) {
                     char h = in[i++];
@@ -174,7 +178,7 @@ inline const auto jstring_raw = combo::lexeme(combo::make_parser([](auto in) {
                     if (h >= '0' && h <= '9') cp |= h - '0';
                     else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
                     else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
-                    else return R{};
+                    else return R{combo::err(in.pos() + i, "invalid \\u hex digit")};
                 }
                 if (cp < 0x80) {
                     s.push_back(static_cast<char>(cp));
@@ -188,50 +192,54 @@ inline const auto jstring_raw = combo::lexeme(combo::make_parser([](auto in) {
                 }
                 break;
             }
-            default: return R{};
+            default:
+                return R{combo::err(in.pos() + i, "invalid escape character")};
         }
     }
-    if (!(i < n && in[i] == '"')) return R{};
+    if (!(i < n && in[i] == '"'))
+        return R{combo::err(in.pos() + i, "unterminated string")};
     ++i;
     return R{combo::result<char, std::string>{in.drop(i), std::move(s)}};
-}));
+});
 
 inline const auto jstring =
     combo::map(jstring_raw, [](std::string s) { return value{std::move(s)}; });
 
 // A JSON number, scanned then converted via strtod.
-inline const auto jnumber = combo::lexeme(combo::make_parser([](auto in) {
+inline const auto jnumber = combo::make_parser([](auto in) {
     using R = combo::parse_result<char, value>;
     std::size_t i = 0, n = in.size();
     auto is_digit = [&](std::size_t k) {
         return k < n && in[k] >= '0' && in[k] <= '9';
     };
     if (i < n && in[i] == '-') ++i;
-    if (!is_digit(i)) return R{};
+    if (!is_digit(i)) return R{combo::err(in.pos() + i, "expected number")};
     while (is_digit(i)) ++i;
     if (i < n && in[i] == '.') {
         ++i;
-        if (!is_digit(i)) return R{};
+        if (!is_digit(i))
+            return R{combo::err(in.pos() + i, "expected digit after '.'")};
         while (is_digit(i)) ++i;
     }
     if (i < n && (in[i] == 'e' || in[i] == 'E')) {
         ++i;
         if (i < n && (in[i] == '+' || in[i] == '-')) ++i;
-        if (!is_digit(i)) return R{};
+        if (!is_digit(i))
+            return R{combo::err(in.pos() + i, "expected digit in exponent")};
         while (is_digit(i)) ++i;
     }
     std::string num(in.begin(), in.begin() + i);
     double d = std::strtod(num.c_str(), nullptr);
     return R{combo::result<char, value>{in.drop(i), value{d}}};
-}));
+});
 
 inline const auto jbool =
-    combo::map(combo::lexeme(combo::literal("true")),
+    combo::map(combo::literal("true"),
                [](std::string) { return value{true}; }) |
-    combo::map(combo::lexeme(combo::literal("false")),
+    combo::map(combo::literal("false"),
                [](std::string) { return value{false}; });
 
-inline const auto jnull = combo::map(combo::lexeme(combo::literal("null")),
+inline const auto jnull = combo::map(combo::literal("null"),
                                      [](std::string) { return value{nullptr}; });
 
 inline const auto jarray = combo::map(
@@ -240,7 +248,7 @@ inline const auto jarray = combo::map(
     [](array a) { return value{std::move(a)}; });
 
 inline const auto jmember = combo::map(
-    combo::seq(jstring_raw, combo::tok(':'), jvalue),
+    combo::seq(combo::lexeme(jstring_raw), combo::tok(':'), jvalue),
     [](std::tuple<std::string, char, value> t) {
         return std::pair<std::string, value>{std::move(std::get<0>(t)),
                                              std::move(std::get<2>(t))};
@@ -252,13 +260,15 @@ inline const auto jobject = combo::map(
     [](object m) { return value{std::move(m)}; });
 
 inline combo::parse_result<char, value> parse_value(combo::array_view<char> in) {
-    static const auto p =
-        jnull | jbool | jstring | jnumber | jarray | jobject;
+    // Skip whitespace once, then commit to one of the value alternatives.
+    static const auto p = combo::ws >> combo::label(
+        jnull | jbool | jstring | jnumber | jarray | jobject, "value");
     return p(in);
 }
 
-// Parse a whole document (trailing whitespace allowed).
-inline std::optional<value> parse(std::string_view text) {
+// Parse a whole document (trailing whitespace allowed). Yields the value or a
+// positioned combo::error.
+inline std::expected<value, combo::error> parse(std::string_view text) {
     auto p = jvalue << combo::ws;
     return combo::parse(p, text);
 }

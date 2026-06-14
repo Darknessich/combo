@@ -1,17 +1,18 @@
 #pragma once
 //
-// parser.hpp — a tiny header-only parser combinator library.
+// parser.hpp — a tiny header-only parser combinator library (C++23).
 //
-// A parser CONSUMES a view of tokens and (maybe) produces a value together
-// with the unconsumed rest of the input:
+// A parser CONSUMES a view of tokens and either succeeds with a value plus the
+// unconsumed rest of the input, or fails with a positioned error:
 //
-//     parser : array_view<Token> -> optional<result<Token, R>>
+//     parser : array_view<Token> -> std::expected<result<Token, R>, error>
 //
 // Combinators build bigger parsers out of smaller ones. See gen.hpp for the
 // dual construction (generators that PRODUCE output from the same algebra).
 //
 #include <algorithm>
 #include <cstddef>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -24,7 +25,9 @@
 namespace combo {
 
 // ---------------------------------------------------------------------------
-// array_view: a non-owning window onto a contiguous range of tokens.
+// array_view: a non-owning window onto a contiguous range of tokens. It also
+// carries its absolute offset from the start of the original input, so a parser
+// always knows *where* it is — which is what positioned errors need.
 // ---------------------------------------------------------------------------
 template <class T>
 class array_view {
@@ -32,8 +35,9 @@ public:
     using value_type = T;
 
     constexpr array_view() noexcept = default;
-    constexpr array_view(const T* data, std::size_t size) noexcept
-        : data_(data), size_(size) {}
+    constexpr array_view(const T* data, std::size_t size,
+                         std::size_t pos = 0) noexcept
+        : data_(data), size_(size), pos_(pos) {}
 
     // Implicit view of any contiguous container (vector, string, string_view,
     // std::array, ...) whose data() yields something convertible to const T*.
@@ -41,17 +45,18 @@ public:
               class = std::enable_if_t<std::is_convertible_v<
                   decltype(std::declval<const C&>().data()), const T*>>>
     constexpr array_view(const C& c) noexcept
-        : data_(c.data()), size_(c.size()) {}
+        : data_(c.data()), size_(c.size()), pos_(0) {}
 
     constexpr bool empty() const noexcept { return size_ == 0; }
     constexpr std::size_t size() const noexcept { return size_; }
+    constexpr std::size_t pos() const noexcept { return pos_; }  // offset from origin
     constexpr const T& operator[](std::size_t i) const noexcept { return data_[i]; }
     constexpr const T& front() const noexcept { return data_[0]; }
 
-    // Drop the first n tokens (clamped), returning the tail.
+    // Drop the first n tokens (clamped), advancing the absolute offset.
     constexpr array_view drop(std::size_t n) const noexcept {
         n = n < size_ ? n : size_;
-        return array_view(data_ + n, size_ - n);
+        return array_view(data_ + n, size_ - n, pos_ + n);
     }
 
     constexpr const T* begin() const noexcept { return data_; }
@@ -60,6 +65,7 @@ public:
 private:
     const T* data_ = nullptr;
     std::size_t size_ = 0;
+    std::size_t pos_ = 0;
 };
 
 // Convenience: build a char view from a string-like value.
@@ -68,7 +74,27 @@ inline array_view<char> view(std::string_view s) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// result / parse_result: a successful parse = leftover input + a value.
+// error: why and where a parse failed. `pos` is filled by combinators; `line`
+// and `col` (1-based) are computed by the top-level runner from the input.
+// ---------------------------------------------------------------------------
+struct error {
+    std::size_t pos = 0;
+    std::size_t line = 0;
+    std::size_t col = 0;
+    std::string msg;
+};
+
+inline std::unexpected<error> err(std::size_t pos, std::string msg) {
+    return std::unexpected(error{pos, 0, 0, std::move(msg)});
+}
+
+inline std::string to_string(const error& e) {
+    return std::to_string(e.line) + ":" + std::to_string(e.col) + ": " + e.msg;
+}
+
+// ---------------------------------------------------------------------------
+// result / parse_result: a successful parse = leftover input + a value;
+// a failed parse = an error.
 // ---------------------------------------------------------------------------
 template <class Token, class R>
 struct result {
@@ -77,7 +103,7 @@ struct result {
 };
 
 template <class Token, class R>
-using parse_result = std::optional<result<Token, R>>;
+using parse_result = std::expected<result<Token, R>, error>;
 
 // ---------------------------------------------------------------------------
 // parser<F>: wraps any callable array_view<Token> -> parse_result<Token, R>.
@@ -107,7 +133,7 @@ struct is_parser<parser<F>> : std::true_type {};
 template <class P>
 concept Parser = is_parser<std::remove_cvref_t<P>>::value;
 
-// Type-erased parser, useful for recursive grammars (see examples/json.cpp).
+// Type-erased parser, useful for recursive grammars (see json.hpp).
 template <class Token, class R>
 using fn_parser =
     parser<std::function<parse_result<Token, R>(array_view<Token>)>>;
@@ -120,26 +146,33 @@ using fn_parser =
 inline const auto item = make_parser([](auto in) {
     using Tok = typename decltype(in)::value_type;
     using R = parse_result<Tok, Tok>;
-    if (in.empty()) return R{};
+    if (in.empty()) return R{err(in.pos(), "unexpected end of input")};
     return R{result<Tok, Tok>{in.drop(1), in.front()}};
 });
 
-// Consume one token if it satisfies a predicate.
+// Consume one token if it satisfies a predicate. `what` names it for errors.
 template <class Pred>
-constexpr auto satisfy(Pred pred) {
-    return make_parser([pred = std::move(pred)](auto in) {
+constexpr auto satisfy(Pred pred, std::string what = "valid input") {
+    return make_parser([pred = std::move(pred), what = std::move(what)](auto in) {
         using Tok = typename decltype(in)::value_type;
         using R = parse_result<Tok, Tok>;
-        if (!in.empty() && pred(in.front()))
+        if (in.empty())
+            return R{err(in.pos(), "expected " + what + ", got end of input")};
+        if (pred(in.front()))
             return R{result<Tok, Tok>{in.drop(1), in.front()}};
-        return R{};
+        return R{err(in.pos(), "expected " + what)};
     });
 }
 
 // Match a specific token by equality.
 template <class T>
 constexpr auto sym(T t) {
-    return satisfy([t](const auto& x) { return x == t; });
+    std::string what;
+    if constexpr (std::is_same_v<T, char>)
+        what = std::string("'") + t + "'";
+    else
+        what = "a specific symbol";
+    return satisfy([t](const auto& x) { return x == t; }, std::move(what));
 }
 
 // Succeed without consuming anything, yielding v.
@@ -151,12 +184,12 @@ constexpr auto pure(V v) {
     });
 }
 
-// Always fail, yielding nothing of type V.
+// Always fail with the given message.
 template <class V>
-constexpr auto fail() {
-    return make_parser([](auto in) {
+constexpr auto fail(std::string msg = "failure") {
+    return make_parser([msg = std::move(msg)](auto in) {
         using Tok = typename decltype(in)::value_type;
-        return parse_result<Tok, V>{};
+        return parse_result<Tok, V>{err(in.pos(), msg)};
     });
 }
 
@@ -165,10 +198,26 @@ inline auto literal(std::string_view s) {
     return make_parser([s = std::string(s)](auto in) {
         using Tok = typename decltype(in)::value_type;
         using R = parse_result<Tok, std::string>;
-        if (in.size() < s.size()) return R{};
         for (std::size_t i = 0; i < s.size(); ++i)
-            if (in[i] != s[i]) return R{};
+            if (i >= in.size() || in[i] != s[i])
+                return R{err(in.pos(), "expected \"" + s + "\"")};
         return R{result<Tok, std::string>{in.drop(s.size()), s}};
+    });
+}
+
+// Give a parser a friendly name in diagnostics. Following Parsec's `<?>`, the
+// message is only replaced for failures that consumed no input; a deeper,
+// committed error (e.g. an unterminated string) keeps its specific message.
+template <Parser P>
+constexpr auto label(P p, std::string name) {
+    return make_parser([p = std::move(p), name = std::move(name)](auto in) {
+        auto r = p(in);
+        if (!r && r.error().pos == in.pos()) {
+            error e = r.error();
+            e.msg = "expected " + name;
+            return decltype(r){std::unexpected(std::move(e))};
+        }
+        return r;
     });
 }
 
@@ -184,7 +233,7 @@ constexpr auto map(P p, F f) {
         auto r = p(in);
         using V = std::remove_cvref_t<decltype(f(std::move(r->value)))>;
         using R = parse_result<Tok, V>;
-        if (!r) return R{};
+        if (!r) return R{std::unexpected(r.error())};
         return R{result<Tok, V>{r->rest, f(std::move(r->value))}};
     });
 }
@@ -195,9 +244,8 @@ constexpr auto bind(P p, F f) {
     return make_parser([p = std::move(p), f = std::move(f)](auto in) {
         auto r = p(in);
         using RT = std::remove_cvref_t<decltype(f(std::move(r->value))(r->rest))>;
-        if (!r) return RT{};
-        auto next = f(std::move(r->value));
-        return next(r->rest);
+        if (!r) return RT{std::unexpected(r.error())};
+        return f(std::move(r->value))(r->rest);
     });
 }
 
@@ -205,13 +253,17 @@ constexpr auto bind(P p, F f) {
 // Sequencing & choice
 // ===========================================================================
 
-// a | b : try a, otherwise try b (both must yield the same type).
+// a | b : try a, otherwise try b. If both fail, report whichever error got
+// further into the input (a more informative diagnostic).
 template <Parser A, Parser B>
 constexpr auto operator|(A a, B b) {
     return make_parser([a = std::move(a), b = std::move(b)](auto in) {
-        auto r = a(in);
-        if (r) return r;
-        return b(in);
+        auto ra = a(in);
+        if (ra) return ra;
+        auto rb = b(in);
+        if (rb) return rb;
+        return decltype(ra){std::unexpected(
+            rb.error().pos > ra.error().pos ? rb.error() : ra.error())};
     });
 }
 
@@ -221,7 +273,7 @@ constexpr auto operator>>(A a, B b) {
     return make_parser([a = std::move(a), b = std::move(b)](auto in) {
         auto ra = a(in);
         using RB = std::remove_cvref_t<decltype(b(ra->rest))>;
-        if (!ra) return RB{};
+        if (!ra) return RB{std::unexpected(ra.error())};
         return b(ra->rest);
     });
 }
@@ -234,9 +286,9 @@ constexpr auto operator<<(A a, B b) {
         auto ra = a(in);
         using V = std::remove_cvref_t<decltype(ra->value)>;
         using R = parse_result<Tok, V>;
-        if (!ra) return R{};
+        if (!ra) return R{std::unexpected(ra.error())};
         auto rb = b(ra->rest);
-        if (!rb) return R{};
+        if (!rb) return R{std::unexpected(rb.error())};
         return R{result<Tok, V>{rb->rest, std::move(ra->value)}};
     });
 }
@@ -259,9 +311,9 @@ constexpr auto seq(P p, Q q, Rest... rest) {
         using Tup = decltype(std::tuple_cat(std::declval<std::tuple<Head>>(),
                                             std::declval<Tail>()));
         using R = parse_result<Tok, Tup>;
-        if (!r1) return R{};
+        if (!r1) return R{std::unexpected(r1.error())};
         auto r2 = tail(r1->rest);
-        if (!r2) return R{};
+        if (!r2) return R{std::unexpected(r2.error())};
         return R{result<Tok, Tup>{
             r2->rest, std::tuple_cat(std::tuple<Head>{std::move(r1->value)},
                                      std::move(r2->value))}};
@@ -299,7 +351,7 @@ constexpr auto many1(P p) {
         using V = std::remove_cvref_t<decltype(p(in)->value)>;
         using R = parse_result<Tok, std::vector<V>>;
         auto first = p(in);
-        if (!first) return R{};
+        if (!first) return R{std::unexpected(first.error())};
         std::vector<V> acc;
         acc.push_back(std::move(first->value));
         auto cur = first->rest;
@@ -313,7 +365,7 @@ constexpr auto many1(P p) {
     });
 }
 
-// opt(p) : zero or one p, yielding std::optional<V>.
+// opt(p) : zero or one p, yielding std::optional<V> (always succeeds).
 template <Parser P>
 constexpr auto opt(P p) {
     return make_parser([p = std::move(p)](auto in) {
@@ -329,6 +381,12 @@ constexpr auto opt(P p) {
 }
 
 // sep_by(p, s) : zero or more p separated by s (no trailing separator).
+//
+// Error handling follows the "consumed input" rule: if the first element fails
+// without consuming anything, the list is simply empty; but once an element has
+// started — or a separator has been seen — a failure is a real error. This is
+// what makes "[1, ]" or "{\"a\": }" report the missing value rather than a
+// confusing "expected ']'".
 template <Parser P, Parser S>
 constexpr auto sep_by(P p, S s) {
     return make_parser([p = std::move(p), s = std::move(s)](auto in) {
@@ -337,15 +395,18 @@ constexpr auto sep_by(P p, S s) {
         using R = parse_result<Tok, std::vector<V>>;
         std::vector<V> acc;
         auto first = p(in);
-        if (!first)
-            return R{result<Tok, std::vector<V>>{in, std::move(acc)}};
+        if (!first) {
+            if (first.error().pos > in.pos())  // started but broke -> real error
+                return R{std::unexpected(first.error())};
+            return R{result<Tok, std::vector<V>>{in, std::move(acc)}};  // empty
+        }
         acc.push_back(std::move(first->value));
         auto cur = first->rest;
         for (;;) {
             auto rs = s(cur);
-            if (!rs) break;
+            if (!rs) break;  // no more separators -> done
             auto rp = p(rs->rest);
-            if (!rp) break;  // dangling separator: don't commit it
+            if (!rp) return R{std::unexpected(rp.error())};  // separator, no element
             acc.push_back(std::move(rp->value));
             cur = rp->rest;
         }
@@ -363,9 +424,9 @@ constexpr auto between(O o, P p, C c) {
 // Lexing helpers (char streams)
 // ===========================================================================
 
-inline const auto ws = many(satisfy([](char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}));
+inline const auto ws = many(satisfy(
+    [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; },
+    "whitespace"));
 
 // lexeme(p) : skip leading whitespace, then run p.
 template <Parser P>
@@ -383,19 +444,52 @@ constexpr auto tok(T c) {
 // Runners
 // ===========================================================================
 
-// Run p over s, returning the raw parse result (rest + value).
-template <Parser P>
-auto run(P p, std::string_view s) {
-    return p(view(s));
+// Translate a byte offset into a 1-based (line, column).
+inline std::pair<std::size_t, std::size_t> line_col(std::string_view s,
+                                                    std::size_t pos) {
+    std::size_t line = 1, col = 1;
+    pos = std::min(pos, s.size());
+    for (std::size_t i = 0; i < pos; ++i) {
+        if (s[i] == '\n') {
+            ++line;
+            col = 1;
+        } else {
+            ++col;
+        }
+    }
+    return {line, col};
 }
 
-// Run p and require that the whole input is consumed; yields optional<V>.
+namespace detail {
+inline error locate(std::string_view s, error e) {
+    auto [line, col] = line_col(s, e.pos);
+    e.line = line;
+    e.col = col;
+    return e;
+}
+}  // namespace detail
+
+// Run p over s, returning the raw parse result (rest + value), with line/col
+// filled in on failure.
+template <Parser P>
+auto run(P p, std::string_view s) {
+    auto r = p(view(s));
+    using T = std::remove_cvref_t<decltype(r)>;
+    if (!r) return T{std::unexpected(detail::locate(s, r.error()))};
+    return r;
+}
+
+// Run p and require that the whole input is consumed; yields expected<V, error>.
 template <Parser P>
 auto parse(P p, std::string_view s) {
     auto r = p(view(s));
     using V = std::remove_cvref_t<decltype(r->value)>;
-    if (r && r->rest.empty()) return std::optional<V>{std::move(r->value)};
-    return std::optional<V>{};
+    using Out = std::expected<V, error>;
+    if (!r) return Out{std::unexpected(detail::locate(s, r.error()))};
+    if (!r->rest.empty())
+        return Out{std::unexpected(detail::locate(
+            s, error{r->rest.pos(), 0, 0, "unexpected trailing input"}))};
+    return Out{std::move(r->value)};
 }
 
 }  // namespace combo

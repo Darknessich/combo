@@ -6,11 +6,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
-
-#include <sstream>
 
 #include "parser.hpp"
 #include "gen.hpp"
@@ -30,19 +29,19 @@ static int checks = 0;
 void test_parsers() {
     using namespace combo;
 
-    // sym / parse (full consume)
-    CHECK(parse(sym('a'), "a") == std::optional<char>{'a'});
+    // sym / parse (full consume); parse yields std::expected<V, error>
+    CHECK(parse(sym('a'), "a") == 'a');
     CHECK(!parse(sym('a'), "b"));
     CHECK(!parse(sym('a'), "aa"));  // leftover -> fail full-consume
 
     // choice
     auto ab = sym('a') | sym('b');
-    CHECK(parse(ab, "b") == std::optional<char>{'b'});
+    CHECK(parse(ab, "b") == 'b');
 
     // map
-    auto digit = satisfy([](char c) { return c >= '0' && c <= '9'; });
+    auto digit = satisfy([](char c) { return c >= '0' && c <= '9'; }, "digit");
     auto to_int = map(digit, [](char c) { return c - '0'; });
-    CHECK(parse(to_int, "7") == std::optional<int>{7});
+    CHECK(parse(to_int, "7") == 7);
 
     // many1 + map: an unsigned integer
     auto number = map(many1(digit), [](std::vector<char> ds) {
@@ -50,12 +49,12 @@ void test_parsers() {
         for (char d : ds) n = n * 10 + (d - '0');
         return n;
     });
-    CHECK(parse(number, "12345") == std::optional<int>{12345});
+    CHECK(parse(number, "12345") == 12345);
     CHECK(!parse(number, ""));
 
     // >> and << keep the right / left value
-    CHECK(parse(sym('(') >> number, "(42") == std::optional<int>{42});
-    CHECK(parse(number << sym(')'), "42)") == std::optional<int>{42});
+    CHECK(parse(sym('(') >> number, "(42") == 42);
+    CHECK(parse(number << sym(')'), "42)") == 42);
 
     // sep_by + between: a comma list inside brackets
     auto list = between(sym('['), sep_by(number, sym(',')), sym(']'));
@@ -71,7 +70,7 @@ void test_parsers() {
 
     // whitespace handling via tok
     auto spaced = tok('a') >> tok('b');
-    CHECK(parse(spaced << ws, "  a   b  ") == std::optional<char>{'b'});
+    CHECK(parse(spaced << ws, "  a   b  ") == 'b');
 }
 
 void test_generators() {
@@ -156,10 +155,40 @@ void test_json_roundtrip() {
     CHECK(!json::parse("nul"));
 }
 
+// Positioned errors: line/col point at the offending spot, with a useful msg.
+void test_errors() {
+    // single token, single line
+    auto e1 = combo::parse(combo::sym('a'), "b");
+    CHECK(!e1);
+    CHECK(e1.error().line == 1 && e1.error().col == 1);
+
+    // missing value after a separator, two lines down
+    auto e2 = json::parse("[1,\n2,\n@]");
+    CHECK(!e2);
+    CHECK(e2.error().line == 3 && e2.error().col == 1);
+    CHECK(e2.error().msg.find("value") != std::string::npos);
+
+    // a committed, specific error survives the "value" label
+    auto e3 = json::parse("\"abc");
+    CHECK(!e3);
+    CHECK(e3.error().msg.find("string") != std::string::npos);
+
+    // missing value inside an object
+    auto e4 = json::parse("{\n  \"a\": 1,\n  \"b\":\n}");
+    CHECK(!e4);
+    CHECK(e4.error().msg.find("value") != std::string::npos);
+
+    // trailing junk is rejected past the value
+    auto e5 = json::parse("12 34");
+    CHECK(!e5);
+    CHECK(e5.error().col > 1);
+}
+
 int main() {
     test_parsers();
     test_generators();
     test_json_roundtrip();
+    test_errors();
     std::cout << "all " << checks << " checks passed\n";
     return 0;
 }
