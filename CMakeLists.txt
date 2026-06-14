@@ -13,3 +13,6 @@ endif()
 add_library(combo INTERFACE)
 target_include_directories(combo INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(combo INTERFACE cxx_std_20)
+
+add_executable(json examples/json.cpp)
+target_link_libraries(json PRIVATE combo)
