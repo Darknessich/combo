@@ -77,7 +77,12 @@ inline schema one_of_str(std::vector<std::string> options) {
 // Pick one of several alternatives uniformly  (dual of parser `a | b`):
 // roll an index, then run that schema.
 inline schema one_of(std::vector<schema> alts) {
-    return erase(g::bind(g::range(0, static_cast<long>(alts.size()) - 1),
+    // Read the count into a sequenced local *before* the move below: the
+    // arguments of a single call are unsequenced, so reading alts.size() inside
+    // g::range(...) while the lambda captures [alts = std::move(alts)] would be
+    // a read of a possibly moved-from vector (range(0, -1) -> UB).
+    const long last = static_cast<long>(alts.size()) - 1;
+    return erase(g::bind(g::range(0, last),
                          [alts = std::move(alts)](long i) { return alts[i]; }));
 }
 
