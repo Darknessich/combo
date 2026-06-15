@@ -13,10 +13,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # gcc-13 (the ubuntu-latest default) crashes in the std::expected-heavy
-          # tests; gcc-14's libstdc++ is fixed, so install and use it explicitly.
-          - { name: linux-gcc, os: ubuntu-latest, cc: gcc-14, cxx: g++-14,
-              packages: "g++-14", cxxflags: "" }
+          - { name: linux-gcc, os: ubuntu-latest, cc: gcc, cxx: g++,
+              packages: "", cxxflags: "" }
           # clang on Linux defaults to libstdc++ too, but that pairing lacks
           # <expected>; point it at libc++ instead.
           - { name: linux-clang, os: ubuntu-latest, cc: clang, cxx: clang++,

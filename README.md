@@ -34,8 +34,9 @@
 
 ## Сборка
 
-Нужен компилятор с C++23 и `<expected>`: **GCC ≥ 14**, **Clang ≥ 16 с libc++**
-или AppleClang ≥ 15. (GCC 13 содержит баг в `std::expected` и падает на тестах.)
+Нужен компилятор с C++23 и `<expected>`: **GCC ≥ 13**, **Clang ≥ 16 с libc++**
+или AppleClang ≥ 15. См.
+[поддержку C++23 компиляторами](https://en.cppreference.com/w/cpp/compiler_support/23).
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
